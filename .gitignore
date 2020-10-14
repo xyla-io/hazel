@@ -1,0 +1,5 @@
+/environment/
+/.idea/
+.DS_Store
+__pycache__/
+*.egg-info
