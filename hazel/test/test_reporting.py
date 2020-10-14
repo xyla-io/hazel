@@ -49,6 +49,19 @@ def consolidate_reports(ads_reporter: GoogleAdsReporter, report_getter: Callable
     df = df.append(customer_df)
   return df
 
+def test_google_ads_performance_reporting(ads_reporter):
+  end = datetime.utcnow().date()
+  start = end - timedelta(days=6)
+  
+  df = ads_reporter.get_performance_report(
+    start_date=start,
+    end_date=end,
+    entity_granularity='campaign',
+    time_granularity='hourly'
+  )
+  assert pd.isna(df['segments#hour']).unique() == [False]
+  assert df is not None
+
 def test_google_ads_ad_reporting(ads_reporter):
   df = consolidate_reports(
     ads_reporter=ads_reporter,

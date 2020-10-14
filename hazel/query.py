@@ -18,9 +18,9 @@ class GoogleAdsQuery:
     return self.query.format(**escaped_parameters)
 
   @classmethod
-  def format_parameter(cls, parameter: any, format_list: bool=True) -> str:
+  def format_parameter(cls, parameter: any, format_list: bool=True, format_time: bool=False) -> str:
     if type(parameter) is date or type(parameter) is datetime:
-      return parameter.strftime("'%Y-%m-%d'")
+      return parameter.strftime("'%Y-%m-%d %H:%M:%S.%f'") if format_time else parameter.strftime("'%Y-%m-%d'")
     elif type(parameter) is list and format_list:
       return '( ' + ', '.join([cls.format_parameter(p, format_list=False) for p in parameter]) + ' )'
     else:

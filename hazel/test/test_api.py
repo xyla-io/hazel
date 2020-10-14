@@ -37,6 +37,28 @@ def test_campaign_targeting_info(api):
   assert target_info_dicts
   import pdb; pdb.set_trace()
 
+def test_get_campaigns(api):
+  customer_ids = api.get_customers()
+  campaigns = api.get_campaigns(customer_id=customer_ids[0])
+  assert campaigns[0]['campaign_id']
+  assert campaigns[0]['campaign_name']
+
+def test_get_ad_groups(api):
+  customer_ids = api.get_customers()
+  campaigns = api.get_campaigns(customer_id=customer_ids[0])
+  ad_groups = api.get_ad_groups(
+    customer_id=customer_ids[0],
+    campaign_id=campaigns[1]['campaign_id']
+  )
+  assert ad_groups[0]['ad_group_id']
+  assert ad_groups[0]['ad_group_name']
+
+def test_customer_metadata(api):
+  customers = api.get_customers()
+  metadata = api.get_customer_metadata(customer_id=customers[0])
+  assert 'customer_manager' in metadata
+  assert 'customer_descriptive_name' in metadata
+
 def test_pause_campaign(api):
   response = api.pause_campaign(campaign_id='CAMPAIGN_ID')
   assert response

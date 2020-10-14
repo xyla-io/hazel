@@ -1,8 +1,10 @@
 import multiprocessing
 import pandas as pd
 import google
+import json
 
-from .api import GoogleAdsAPI, GoogleAdWordsAPI
+from .context import GoogleAdsEntity
+from .api import GoogleAdsAPI, GoogleAdWordsAPI, GoogleAdsValueExtractorType
 from .base import handle_ga_permission_error
 from .query import GoogleAdsQuery
 from typing import List, Dict, Set, Optional
@@ -19,7 +21,7 @@ class GoogleAdsReporter:
     self.verbose = verbose
 
   @handle_ga_permission_error()
-  def get_query_data_frame(self, query: GoogleAdsQuery, customer_id: Optional[str]=None, exclude_keys: List[str]=['resource_name'], exclude_prefixes: List[str]=['value'], delimiter: str='#', substitute_enum_names: bool=True, json_encode_repeated: bool=True, flatten_single_keys: Optional[Set[str]]={''}, path_overrides: Dict[str, Dict[str, any]]={}) -> Optional[pd.DataFrame]:
+  def get_query_data_frame(self, query: GoogleAdsQuery, customer_id: Optional[str]=None, exclude_keys: List[str]=['resource_name'], exclude_prefixes: List[str]=['value'], delimiter: str='#', substitute_enum_names: bool=True, json_encode_repeated: bool=True, flatten_single_keys: Optional[Set[str]]={''}, path_overrides: Dict[str, Dict[str, any]]={}, value_extractor: Optional[GoogleAdsValueExtractorType]=None) -> Optional[pd.DataFrame]:
     if customer_id is None:
       customer_id = self.api.customer_id
 
@@ -34,7 +36,8 @@ class GoogleAdsReporter:
       substitute_enum_names=substitute_enum_names,
       json_encode_repeated=json_encode_repeated,
       flatten_single_keys=flatten_single_keys,
-      path_overrides=path_overrides
+      path_overrides=path_overrides,
+      value_extractor=value_extractor
     )
     return df
 
@@ -564,6 +567,406 @@ class GoogleAdsReporter:
     self.api.substitute_enum_name(df=df, column_name='ad_group_criterion#system_serving_status', enum=CriterionSystemServingStatusEnum.CriterionSystemServingStatus)
     self.api.substitute_enum_name(df=df, column_name='segments#device', enum=DeviceEnum.Device)
     return df
+  
+  @handle_ga_permission_error(default_value=pd.DataFrame())
+  def get_performance_report(self, start_date: datetime, end_date: datetime, entity_granularity: str, time_granularity: str, entity_ids: Optional[List[str]]=None) -> pd.DataFrame:
+    def select_columns(entity_granularity: str):
+      if entity_granularity == 'ad':
+        return (
+          ', campaign.id'
+          ', campaign.name'
+          ', campaign.start_date'
+          ', campaign.app_campaign_setting.app_id'
+          ', campaign.app_campaign_setting.app_store'
+          ', campaign.app_campaign_setting.bidding_strategy_goal_type'
+          ', campaign.bidding_strategy_type'
+          ', campaign.selective_optimization.conversion_actions'
+          ', ad_group.id'
+          ', ad_group.name'
+          ', ad_group.status'
+          ', ad_group.type'
+          ', ad_group.target_cpa_micros'
+          ', ad_group_ad.ad.id'
+          ', ad_group_ad.ad.name'
+          ', ad_group_ad.status'
+        )
+      elif entity_granularity == 'ad_group':
+        return (
+          ', campaign.id'
+          ', campaign.name'
+          ', campaign.start_date'
+          ', campaign.app_campaign_setting.app_id'
+          ', campaign.app_campaign_setting.app_store'
+          ', campaign.app_campaign_setting.bidding_strategy_goal_type'
+          ', campaign.selective_optimization.conversion_actions'
+          ', campaign.bidding_strategy_type'
+          ', ad_group.id'
+          ', ad_group.name'
+          ', ad_group.status'
+          ', ad_group.type'
+          ', ad_group.target_cpa_micros'
+        )
+      elif entity_granularity == 'campaign':
+        return (
+          ', campaign.id'
+          ', campaign.name'
+          ', campaign.start_date'
+          ', campaign.app_campaign_setting.app_id'
+          ', campaign.app_campaign_setting.app_store'
+          ', campaign.app_campaign_setting.bidding_strategy_goal_type'
+          ', campaign.bidding_strategy_type'
+          ', campaign.selective_optimization.conversion_actions'
+        )
+    
+    def select_table(entity_granularity: str):
+      if entity_granularity == 'ad':
+        return 'ad_group_ad'
+      elif entity_granularity == 'ad_group':
+        return 'ad_group'
+      elif entity_granularity == 'campaign':
+        return 'campaign'
+
+    query = GoogleAdsQuery(
+      query=(''
+        'SELECT customer.id'
+          ', customer.descriptive_name'
+          ', customer.currency_code'
+          ', customer.time_zone'
+          f'{select_columns(entity_granularity)}'
+          ', metrics.cost_micros'
+          ', metrics.impressions'
+          ', metrics.clicks'
+          ', metrics.conversions'
+          ', metrics.conversions_value'
+          f"{(', metrics.all_conversions' if time_granularity != 'hourly' else '')}"
+          ', segments.date '
+          f"{(', segments.hour ' if time_granularity == 'hourly' else '')}"
+        f'FROM {select_table(entity_granularity)} '
+        'WHERE segments.date >= {start_date} '
+          'AND segments.date <= {end_date} '
+          f"{(f'AND {select_table(entity_granularity)}.id IN {{entity_ids}}' if entity_ids is not None else '')}"
+      ),
+      parameters={
+        'start_date': start_date,
+        'end_date': end_date,
+        **({'entity_ids': entity_ids} if entity_ids is not None else {}),
+      }
+    )
+
+    df = self.get_query_data_frame(
+      query=query,
+      customer_id=self.api.customer_id,
+      value_extractor=lambda path, key, value, **kwargs: {key: 0} if ((path == ['segments'] and key == 'hour') or path == ['metrics']) and value.value == 0 else None
+    )
+    if df is None:
+      return pd.DataFrame()
+    return df
+
+  def entity_table(self, entity_granularity: str):
+    if entity_granularity == 'ad':
+      return 'ad_group_ad'
+    elif entity_granularity == 'ad_group':
+      return 'ad_group'
+    elif entity_granularity == 'campaign':
+      return 'campaign'
+
+  def add_selected_conversions(self, report: pd.DataFrame, start_date: datetime, end_date: datetime, entity_granularity: str, time_granularity: str, suffix: str='') -> pd.DataFrame:
+    if report.empty:
+      return report.copy()
+    def finish(result_report: pd.DataFrame):
+      for c in [
+        'selected_conversion_actions',
+        'selected_conversions',
+        'total_conversions',
+      ]:
+        if c not in result_report.columns:
+          result_report[c] = None
+      result_report['selected_conversions'].fillna(0, inplace=True)
+      result_report['total_conversions'].fillna(0, inplace=True)
+      return result_report
+
+    conversion_action_entity_ids = list(report[f'{self.entity_table(entity_granularity)}#id'].unique())
+    if not conversion_action_entity_ids:
+      return finish(report)
+
+    selected_conversion_action_df = self.get_selected_conversions_report(
+      start_date=start_date,
+      end_date=end_date,
+      entity_granularity=entity_granularity,
+      time_granularity=time_granularity,
+      entity_ids=conversion_action_entity_ids
+    )
+    if selected_conversion_action_df.empty:
+      return finish(report)
+    if 'customer#time_zone' in report.columns:
+      selected_conversion_action_df.drop(columns='customer#time_zone', inplace=True)
+    merged_df = report.merge(
+      selected_conversion_action_df,
+      how='left',
+      on=[
+        f'{self.entity_table(entity_granularity)}#id',
+        'segments#date',
+        *(['segments#hour'] if time_granularity == 'hourly' else []),
+      ],
+      suffixes=('', suffix)
+    )
+    return finish(merged_df)
+
+  @handle_ga_permission_error(default_value=pd.DataFrame())
+  def get_selected_conversions_report(self, start_date: datetime, end_date: datetime, entity_granularity: str, time_granularity: str, entity_ids: Optional[List[str]]=None) -> pd.DataFrame:
+    conversion_action_query = GoogleAdsQuery(
+      query=(''
+        f'SELECT customer.time_zone'
+          f', {self.entity_table(entity_granularity)}.id'
+          ', campaign.selective_optimization.conversion_actions'
+          ', metrics.conversions'
+          ', segments.conversion_action'
+          ', segments.conversion_action_name'
+          ', segments.date'
+          f"{(', segments.hour ' if time_granularity == 'hourly' else ' ')}"
+        f'FROM {self.entity_table(entity_granularity)} '
+        'WHERE segments.date >= {start_date} '
+          'AND segments.date <= {end_date} '
+          f"{(f'AND {self.entity_table(entity_granularity)}.id IN {{entity_ids}}' if entity_ids is not None else '')} "
+          'AND metrics.conversions != 0'
+      ),
+      parameters={
+        'start_date': start_date,
+        'end_date': end_date,
+        'entity_ids': entity_ids
+      }
+    )
+    conversion_action_df = self.get_query_data_frame(
+      query=conversion_action_query,
+      customer_id=self.api.customer_id,
+      json_encode_repeated=False,
+      value_extractor=lambda path, key, value, **kwargs: {key: 0} if ((path == ['segments'] and key == 'hour') or path == ['metrics']) and value.value == 0 else None
+    )
+
+    if conversion_action_df is None:
+      return pd.DataFrame()
+    if conversion_action_df.empty:
+      return conversion_action_df
+
+    conversion_action_df['selected_conversions'] = 0
+    conversion_action_df['total_conversions'] = conversion_action_df['metrics#conversions']
+    conversion_action_df['selected_conversion_actions'] = None
+    if 'campaign#selective_optimization#conversion_actions' in conversion_action_df.columns:
+      conversion_action_df['selected_conversion_actions'] = conversion_action_df['campaign#selective_optimization#conversion_actions']
+      location = conversion_action_df.loc[conversion_action_df['campaign#selective_optimization#conversion_actions'].notna()]
+      conversion_action_df.loc[location.index, 'selected_conversions'] = location.apply(lambda r: r ['metrics#conversions'] if r['segments#conversion_action'] in r['campaign#selective_optimization#conversion_actions'] else 0, axis='columns')
+
+    group_by = [
+      'customer#time_zone',
+      f'{self.entity_table(entity_granularity)}#id',
+      'segments#date',
+      *(['segments#hour'] if time_granularity == 'hourly' else []),
+    ]
+    columns = [
+      *group_by,
+      'selected_conversion_actions',
+      'selected_conversions',
+      'total_conversions',
+    ]
+    aggregated_df = conversion_action_df[columns].groupby(group_by).agg({
+      'selected_conversion_actions': 'max',
+      'selected_conversions': 'sum',
+      'total_conversions': 'sum',
+    }).reset_index()
+
+    return aggregated_df
+
+  @handle_ga_permission_error(default_value=pd.DataFrame())
+  def get_change_report(self, entity_granularity: str, entity_ids: List[str], start_date: Optional[datetime]=None, end_date: Optional[datetime]=None) -> pd.DataFrame:
+    def select_columns(entity_granularity: str):
+      if entity_granularity == 'ad':
+        return (
+          ', campaign.id'
+          ', campaign.name'
+          ', ad_group.id'
+          ', ad_group.name'
+          ', ad_group_ad.ad.id'
+          ', ad_group_ad.ad.name'
+        )
+      elif entity_granularity == 'ad_group':
+        return (
+          ', campaign.id'
+          ', campaign.name'
+          ', ad_group.id'
+          ', ad_group.name'
+          ', change_status.ad_group_criterion'
+        )
+      elif entity_granularity == 'campaign':
+        return (
+          ', campaign.id'
+          ', campaign.name'
+          ', change_status.campaign_criterion'
+        )
+
+    query = GoogleAdsQuery(
+      query=(''
+        'SELECT customer.id'
+          ', customer.descriptive_name'
+          ', customer.currency_code'
+          ', customer.time_zone'
+          f'{select_columns(entity_granularity)}'
+          ', change_status.last_change_date_time'
+          ', change_status.resource_status'
+          ', change_status.resource_type '
+        f'FROM change_status '
+        f'WHERE {entity_granularity}.id IN {{entity_ids}} '
+        f"{'AND change_status.last_change_date_time >= {start_date} ' if start_date is not None else ''}"
+        f"{'AND change_status.last_change_date_time <= {end_date}' if end_date is not None else ''}"
+      ),
+      parameters={
+        'start_date': GoogleAdsQuery.format_parameter(start_date, format_time=True).strip("'"),
+        'end_date':  GoogleAdsQuery.format_parameter(end_date, format_time=True).strip("'"),
+        'entity_ids': entity_ids,
+      }
+    )
+
+    df = self.get_query_data_frame(
+      query=query,
+      customer_id=self.api.customer_id,
+    )
+    if df is None:
+      return pd.DataFrame()
+
+    merged_df = df
+    for criterion_table in ['campaign_criterion', 'ad_group_criterion']:
+      criterion_column = f'change_status#{criterion_table}'
+      if criterion_column not in merged_df.columns:
+        continue
+      criterion_query = GoogleAdsQuery(
+        query=(''
+          f'SELECT {criterion_table}.resource_name'
+            f', {criterion_table}.type'
+            f', {criterion_table}.status '
+          f'FROM {criterion_table} '
+          f'WHERE {criterion_table}.resource_name IN {{criteria}}'
+        ),
+        parameters={
+          'criteria': sorted(filter(lambda v: not pd.isna(v), df[criterion_column].unique()))
+        }
+      )
+      criterion_df = self.get_query_data_frame(
+        query=criterion_query,
+        customer_id=self.api.customer_id,
+        exclude_keys=[]
+      )
+      if criterion_df is None or criterion_df.empty:
+        continue
+
+      # TODO: Figure out why the conversion_action_query does not retrieve most of the conversion action resources by which the ad query is segmented.
+      merged_df = merged_df.merge(
+        left_on=criterion_column, 
+        right_on=f'{criterion_table}#resource_name',
+        right=criterion_df,
+        how='left'
+      )
+    return merged_df
+    
+  @handle_ga_permission_error(default_value=pd.DataFrame())
+  def get_safety_report(self, entity_granularity: str, entity_ids: List[str], start_date: Optional[datetime]=None, end_date: Optional[datetime]=None) -> pd.DataFrame:
+    def select_columns(entity_granularity: str):
+      if entity_granularity == 'ad':
+        return (
+          ', campaign.id'
+          ', campaign.name'
+          ', ad_group.id'
+          ', ad_group.name'
+          ', ad_group_ad.ad.id'
+          ', ad_group_ad.ad.name'
+        )
+      elif entity_granularity == 'ad_group':
+        return (
+          ', campaign.id'
+          ', campaign.name'
+          ', ad_group.id'
+          ', ad_group.name'
+        )
+      elif entity_granularity == 'campaign':
+        return (
+          ', campaign.id'
+          ', campaign.name'
+          # ', campaign.labels'
+          ', campaign.start_date'
+          ', campaign.status'
+          ', campaign.bidding_strategy_type'
+          ', campaign.target_cpa.target_cpa_micros'
+          ', campaign_budget.type'
+          ', campaign_budget.status'
+          ', campaign_budget.amount_micros'
+          ', campaign_budget.period'
+          ', metrics.conversions'
+        )
+    
+    def select_table(entity_granularity: str):
+      if entity_granularity == 'ad':
+        return 'ad_group_ad'
+      elif entity_granularity == 'ad_group':
+        return 'ad_group'
+      elif entity_granularity == 'campaign':
+        return 'campaign'
+
+    query = GoogleAdsQuery(
+      query=(''
+        'SELECT customer.id'
+          ', customer.descriptive_name'
+          ', customer.currency_code'
+          ', customer.time_zone'
+          f'{select_columns(entity_granularity)} '
+        f'FROM {select_table(entity_granularity)} '
+        f'WHERE {entity_granularity}.id IN {{entity_ids}} '
+        f"{'AND segments.date >= {start_date} ' if start_date is not None else ''}"
+        f"{'AND segments.date <= {end_date}' if end_date is not None else ''}"
+      ),
+      parameters={
+        'start_date': start_date,
+        'end_date': end_date,
+        **({'entity_ids': entity_ids} if entity_ids is not None else {}),
+      }
+    )
+
+    df = self.get_query_data_frame(
+      query=query,
+      customer_id=self.api.customer_id,
+      value_extractor=lambda path, key, value, **kwargs: {key: 0} if path == ['metrics'] and key == 'conversions' and value.value == 0 else None
+    )
+    return df if df is not None else pd.DataFrame()
+
+  @handle_ga_permission_error(default_value=pd.DataFrame())
+  def get_entity_report(self, granularity: str, ids: Optional[List[str]]=None, columns: Optional[List[str]]=None) -> pd.DataFrame:
+    if columns is None:
+      columns = []
+    entity = GoogleAdsEntity(granularity)
+    id_columns = [f'{e.value}.id' for e in (*reversed(entity.higher), entity)]
+    all_columns = [
+      *[
+        c 
+        for c in id_columns
+        if c not in columns
+      ],
+      *columns,
+    ]
+
+    query = GoogleAdsQuery(
+      query=(''
+        f'SELECT {", ".join(all_columns)} '
+        f'FROM {entity.value} '
+        f"{f'WHERE {entity}.id IN {{ids}} ' if ids is not None else ''}"
+      ),
+      parameters={
+        **({'ids': ids} if ids is not None else {}),
+      }
+    )
+
+    df = self.get_query_data_frame(
+      query=query,
+      customer_id=self.api.customer_id,
+    )
+    df.rename(columns=lambda c: c.replace('#', '.'), inplace=True)
+    return df if df is not None else pd.DataFrame()
 
 class GoogleAdWordsReporter:
   api: GoogleAdWordsAPI

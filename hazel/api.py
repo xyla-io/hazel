@@ -7,11 +7,14 @@ import pandas as pd
 from .base import handle_ga_permission_error
 from .query import GoogleAdsQuery
 from googleads import adwords, oauth2
-from typing import Dict, List, Set, Optional
+from typing import Dict, List, Set, Optional, Callable
 from string import Formatter
 from google.ads.google_ads.client import GoogleAdsClient
 from google.ads.google_ads.v3.services.enums import DeviceEnum
 from google.api_core import protobuf_helpers
+from moda import log
+
+GoogleAdsValueExtractorType = Callable[[any, List[str], any, any, any, str, any, bool, bool, bool], Optional[Dict[str, any]]]
 
 class GoogleAdsAPI:
   client: GoogleAdsClient
@@ -193,8 +196,12 @@ WHERE
         target_dictionary[last_path_component] = list(sorted(set(target_dictionary[last_path_component] + [target.format(**row)])))
     return return_dictionary
 
-  def _fields_to_dict(self, field_listable: any, substitute_enum_names: bool, context: Optional[Dict[str, any]]=None) -> Dict[str, any]:
+  def _fields_to_dict(self, field_listable: any, substitute_enum_names: bool, context: Optional[Dict[str, any]]=None, value_extractor: Optional[GoogleAdsValueExtractorType]=None, _root_field_listable: Optional[any]=None, _path: Optional[List[str]]=None) -> Dict[str, any]:
     context = log_context(context=context)
+    if _root_field_listable is None:
+      _root_field_listable = field_listable
+    if _path is None:
+      _path = []
 
     d = {}
     for f in field_listable.ListFields():
@@ -204,12 +211,31 @@ WHERE
       recurse = metadata.type == metadata.TYPE_MESSAGE
       multiple_values = metadata.label == metadata.LABEL_REPEATED
 
+      if value_extractor is not None:
+        extracted = value_extractor(
+          root_field_listable=_root_field_listable,
+          path=_path,
+          field_listable=field_listable,
+          field=f,
+          metadata=metadata,
+          key=key,
+          value=value,
+          recurse=recurse,
+          multiple_values=multiple_values,
+          substitute_enum_names=substitute_enum_names
+        )
+        if extracted is not None:
+          d.update(extracted)
+          continue
       if recurse and multiple_values:
         d[key] = [
           self._fields_to_dict(
             field_listable=v,
             substitute_enum_names=substitute_enum_names,
-            context=context
+            context=context,
+            value_extractor=value_extractor,
+            _root_field_listable=_root_field_listable,
+            _path=_path + [key]
           )
           for v in value
         ]
@@ -217,7 +243,10 @@ WHERE
         d[key] = self._fields_to_dict(
           field_listable=value,
           substitute_enum_names=substitute_enum_names,
-          context=context
+          context=context,
+          value_extractor=value_extractor,
+          _root_field_listable=_root_field_listable,
+          _path=_path + [key]
         )
       elif multiple_values:
         d[key] = list(value)
@@ -311,9 +340,17 @@ WHERE
 
     return flattened_dict      
 
-  def response_to_data_frame(self, response: any, exclude_keys: List[str]=['resource_name'], exclude_prefixes: List[str]=['value'], delimiter: str='#', substitute_enum_names: bool=False, json_encode_repeated: bool=False, flatten_single_keys: Optional[Set[str]]={''}, max_depth: Optional[int]=None, path_overrides: Dict[str, Dict[str, any]]={}) -> pd.DataFrame:
+  def response_to_record(self, response: any, substitute_enum_names: bool=False, value_extractor: Optional[GoogleAdsValueExtractorType]=None) -> Dict[str, any]:
+    record = self._fields_to_dict(
+      field_listable=response,
+      substitute_enum_names=substitute_enum_names,
+      value_extractor=value_extractor
+    )
+    return record
+    
+  def response_to_data_frame(self, response: any, exclude_keys: List[str]=['resource_name'], exclude_prefixes: List[str]=['value'], delimiter: str='#', substitute_enum_names: bool=False, json_encode_repeated: bool=False, flatten_single_keys: Optional[Set[str]]={''}, max_depth: Optional[int]=None, path_overrides: Dict[str, Dict[str, any]]={}, value_extractor: Optional[GoogleAdsValueExtractorType]=None) -> pd.DataFrame:
     fields_context = {'counter': 0}
-    print('Parsing Google Ads response...')
+    log.log('Parsing Google Ads response...')
     flatten_context = {
       'message': 'Flattening Google Ads response objects {counter}...',
       'interval': 100000,
@@ -323,7 +360,8 @@ WHERE
       dictionary = self._fields_to_dict(
         field_listable=row,
         substitute_enum_names=substitute_enum_names,
-        context=fields_context
+        context=fields_context,
+        value_extractor=value_extractor
       )
       flattened_record = self._flatten_fields_dict(
         fields_dictionary=dictionary,
@@ -338,7 +376,7 @@ WHERE
       )
       flattened_records.append(flattened_record)
 
-    print(f'Parsed {fields_context["counter"]} Google Ads response rows')
+    log.log(f'Parsed {fields_context["counter"]} Google Ads response rows')
     df = pd.DataFrame(flattened_records)
     return df
 
@@ -349,34 +387,65 @@ WHERE
   def substitute_enum_names(self, df: pd.DataFrame, column_to_enum_map: Dict[str, any]):
     for c, e in column_to_enum_map.items():
       self.substitute_enum_name(df=df, column_name=c, enum=e)
-  
-  def pause_campaign(self, campaign_id: str) -> Optional[any]:
-    service = self.client.get_service('CampaignService', version=self.api_version)
-    operation = self.client.get_type('CampaignOperation', version=self.api_version)
 
-    campaign = operation.update
-    campaign.resource_name = service.campaign_path(self.customer_id, campaign_id)
-    campaign.status = self.client.get_type('CampaignStatusEnum', version=self.api_version).PAUSED
+  #----------------------------------------------
+  # Management
+  #----------------------------------------------
 
-    field_mask = protobuf_helpers.field_mask(None, campaign)
-    operation.update_mask.CopyFrom(field_mask)
+  @handle_ga_permission_error()
+  def get_customer_metadata(self, customer_id: str=None) -> Optional[bool]:
+    ga_service = self.client.get_service('GoogleAdsService', version=self.api_version)
+    query = GoogleAdsQuery(
+      query=('SELECT customer.manager '
+               ', customer.descriptive_name '
+             'FROM customer '
+             'WHERE customer.id = {customer_id}'),
+      parameters={'customer_id': customer_id}
+    )
+    response = ga_service.search(customer_id, query.query_text, page_size=self._page_size)
+    df = self.response_to_data_frame(response=response, delimiter='_')
+    assert len(df) == 1
+    return df.to_dict(orient='records')[0]
 
-    def print_error(ex):
-      print('Request with ID "%s" failed with status "%s" and includes the '
-              'following errors:' % (ex.request_id, ex.error.code().name))
-      for error in ex.failure.errors:
-        print('\tError with message "%s".' % error.message)
-        if error.location:
-          for field_path_element in error.location.field_path_elements:
-            print('\t\tOn field: %s' % field_path_element.field_name)      
+  @handle_ga_permission_error(default_value=pd.DataFrame())
+  def get_campaigns(self, customer_id: str=None) -> List[Dict[str, any]]:
+    if customer_id is None:
+      customer_id = self.customer_id
+    ga_service = self.client.get_service('GoogleAdsService', version=self.api_version)
 
-    try:
-      response = service.mutate_campaigns(self.customer_id, [operation])
-    except google.ads.google_ads.errors.GoogleAdsException as ex:
-      print_error(ex)
-      response = None
-    
-    return response
+    query = GoogleAdsQuery(
+      query=(''
+        'SELECT campaign.id'
+          ', campaign.name '
+        'FROM campaign'
+      )
+    )
+
+    response = ga_service.search(customer_id, query.query_text, page_size=self._page_size)
+    df = self.response_to_data_frame(response=response, delimiter='_')
+    return df.to_dict(orient='records')
+
+  @handle_ga_permission_error(default_value=pd.DataFrame())
+  def get_ad_groups(self, customer_id: str=None, campaign_id: str=None) -> List[Dict[str, any]]:
+    if customer_id is None:
+      customer_id = self.customer_id
+    ga_service = self.client.get_service('GoogleAdsService', version=self.api_version)
+
+    query = GoogleAdsQuery(
+      query=(''
+        'SELECT ad_group.id'
+          ', ad_group.name '
+        'FROM ad_group '
+        'WHERE campaign.id = {campaign_id}'
+      ),
+      parameters={
+        'campaign_id': campaign_id
+      }
+    )
+
+    response = ga_service.search(customer_id, query.query_text, page_size=self._page_size)
+    df = self.response_to_data_frame(response=response, delimiter='_')
+    return df.to_dict(orient='records')
 
 class GoogleAdWordsAPI:
   client: adwords.AdWordsClient
@@ -446,11 +515,11 @@ class GoogleAdWordsAPI:
     fields = report_definition_service.getReportFields(report_type)
 
     # Display results.
-    print('Report type "%s" contains the following fields:' % report_type)
+    log.log('Report type "%s" contains the following fields:' % report_type)
     for field in fields:
-      print(' - %s (%s)' % (field['fieldName'], field['fieldType']))
+      log.log(' - %s (%s)' % (field['fieldName'], field['fieldType']))
       if 'enumValues' in field:
-        print('  := [%s]' % ', '.join(field['enumValues']))
+        log.log('  := [%s]' % ', '.join(field['enumValues']))
 
 def log_context(context: Optional[Dict[str, any]]) -> Dict[str, any]:
   """Increments a counter for a recursive function context, and prints a log message at counter intervals"""
@@ -460,7 +529,7 @@ def log_context(context: Optional[Dict[str, any]]) -> Dict[str, any]:
     context['counter'] = 0
   context['counter'] += 1
   if 'message' in context and 'interval' in context and not context['counter'] % context['interval']:
-    print(context['message'].format(**{k: v for k, v in context.items() if k != 'message'}))
+    log.log(context['message'].format(**{k: v for k, v in context.items() if k != 'message'}))
     sys.stdout.flush()
 
   return context
